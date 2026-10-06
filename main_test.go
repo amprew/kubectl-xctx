@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -385,5 +387,163 @@ func TestCompleteArgs_KubectlCompletionError(t *testing.T) {
 	_, dir := completeArgs(nil, []string{"prod", "get"}, "")
 	if dir != cobra.ShellCompDirectiveDefault {
 		t.Errorf("expected Default directive on error, got %d", dir)
+	}
+}
+
+func TestIsStreaming(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"logs", "-f", "-n", "my-ns", "-l", "app=my-app"}, true},
+		{[]string{"logs", "pod", "--follow"}, true},
+		{[]string{"logs", "pod", "--follow=true"}, true},
+		{[]string{"logs", "pod", "-f=false"}, false},
+		{[]string{"logs", "pod", "--follow=false"}, false},
+		{[]string{"get", "pods", "-w"}, true},
+		{[]string{"get", "pods", "--watch"}, true},
+		{[]string{"get", "pods", "--watch=true"}, true},
+		{[]string{"get", "pods", "--watch-only"}, true},
+		{[]string{"get", "pods", "--watch=false"}, false},
+		{[]string{"apply", "-f", "deployment.yaml"}, false},
+		{[]string{"logs", "pod"}, false},
+		{[]string{"get", "pods", "--", "-w"}, false},
+		{[]string{"--", "logs", "pod", "-f"}, true},
+		{nil, false},
+	} {
+		t.Run(strings.Join(test.args, " "), func(t *testing.T) {
+			if got := isStreaming(test.args); got != test.want {
+				t.Errorf("isStreaming(%v) = %v, want %v", test.args, got, test.want)
+			}
+		})
+	}
+}
+
+func TestStreamWriter(t *testing.T) {
+	for _, prefix := range []string{"[prod] ", ""} {
+		t.Run(prefix, func(t *testing.T) {
+			var out strings.Builder
+			writer := &streamWriter{out: &out, mu: &sync.Mutex{}, prefix: prefix}
+			for _, chunk := range []string{"first", " line\nsecond\n", "tail"} {
+				if count, err := io.WriteString(writer, chunk); err != nil || count != len(chunk) {
+					t.Fatalf("Write = %d, %v", count, err)
+				}
+			}
+			if !strings.Contains(out.String(), "second\n") {
+				t.Fatal("complete lines were buffered")
+			}
+			if err := writer.flush(); err != nil {
+				t.Fatal(err)
+			}
+			want := prefix + "first line\n" + prefix + "second\n" + prefix + "tail"
+			if out.String() != want {
+				t.Errorf("output = %q, want %q", out.String(), want)
+			}
+		})
+	}
+}
+
+func TestStreamWriter_SplitLines(t *testing.T) {
+	var out strings.Builder
+	var mu sync.Mutex
+	first := &streamWriter{out: &out, mu: &mu, prefix: "[a] "}
+	second := &streamWriter{out: &out, mu: &mu, prefix: "[b] "}
+	_, _ = io.WriteString(first, "split ")
+	_, _ = io.WriteString(second, "other\n")
+	_, _ = io.WriteString(first, "line\n")
+	if want := "[b] other\n[a] split line\n"; out.String() != want {
+		t.Errorf("output = %q, want %q", out.String(), want)
+	}
+}
+
+func TestRunStreaming_Cancellation(t *testing.T) {
+	original := streamRunner
+	t.Cleanup(func() { streamRunner = original })
+	streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out, errOut strings.Builder
+	done := make(chan error, 1)
+	go func() {
+		done <- runStreaming(ctx, []string{"prod-a", "prod-b"}, []string{"get", "pods", "-w"}, "", &out, &errOut)
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "2 context(s) failed" {
+			t.Errorf("unexpected cancellation error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("streams did not stop on cancellation")
+	}
+}
+
+func TestRunStreaming_LiveConcurrentOutput(t *testing.T) {
+	original := streamRunner
+	t.Cleanup(func() { streamRunner = original })
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
+		if _, ok := ctx.Deadline(); ok {
+			return errors.New("unexpected deadline")
+		}
+		if strings.Join(args[2:], " ") != "logs -f" {
+			return fmt.Errorf("unexpected args: %v", args)
+		}
+		_, _ = io.WriteString(out, "live\n")
+		_, _ = io.WriteString(errOut, "warning\n")
+		started <- args[1]
+		<-release
+		return nil
+	}
+	var out, errOut strings.Builder
+	done := make(chan error, 1)
+	go func() {
+		done <- runStreaming(context.Background(), []string{"prod-a", "prod-b"}, []string{"logs", "-f"}, "header", &out, &errOut)
+	}()
+	for range []string{"prod-a", "prod-b"} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			<-done
+			t.Fatal("contexts did not start concurrently")
+		}
+	}
+	for _, name := range []string{"prod-a", "prod-b"} {
+		if !strings.Contains(out.String(), "["+name+"] live\n") || !strings.Contains(errOut.String(), "["+name+"] warning\n") {
+			t.Errorf("missing live output for %s: stdout=%q stderr=%q", name, out.String(), errOut.String())
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecute_Streaming(t *testing.T) {
+	useFakeKubectl(t)
+	original := streamRunner
+	t.Cleanup(func() { streamRunner = original })
+	for _, args := range [][]string{{"logs", "-f"}, {"get", "pods", "-w"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			called := make(chan string, 2)
+			streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
+				if _, ok := ctx.Deadline(); ok {
+					return errors.New("stream must ignore timeout")
+				}
+				called <- args[1]
+				return errors.New("stream failed")
+			}
+			if err := execute("prod", args, false, false, time.Nanosecond, true, ""); err == nil || err.Error() != "2 context(s) failed" {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if len(called) != 2 {
+				t.Errorf("expected both contexts despite fail-fast, got %d", len(called))
+			}
+		})
 	}
 }

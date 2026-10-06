@@ -35,7 +35,7 @@ xctx flags must come before the pattern. Everything after the pattern is passed 
 |------|-------|---------|-------------|
 | `--parallel` | `-p` | false | Run across all contexts concurrently |
 | `--list` | `-l` | false | List matching contexts without executing |
-| `--timeout` | `-t` | 0 | Per-context timeout (e.g. `10s`, `1m`). 0 = no timeout |
+| `--timeout` | `-t` | 0 | Per-context timeout (e.g. `10s`, `1m`). 0 = no timeout. Ignored for streamed output. |
 | `--fail-fast` | | false | Stop after first failure (sequential mode only) |
 | `--header` | | `### Context: {context}` | Header template. Use `{context}` as placeholder, `""` to suppress |
 | `--version` | | | Print version |
@@ -58,12 +58,22 @@ kubectl xctx --list "prod"
 # Run with a per-context timeout (skip unreachable clusters)
 kubectl xctx --timeout 10s "." get pods -n kube-system
 
+# Follow logs across all matching contexts (streams live, prefixed per context)
+kubectl xctx "prod" logs -f -n my-ns -l app=my-app
+
+# Watch pods across all matching contexts
+kubectl xctx "prod" get pods -w -n my-ns
+
 # Stop immediately on first failure
 kubectl xctx --fail-fast "prod" apply -f deployment.yaml
 
 # Suppress headers (useful for piping)
 kubectl xctx --header "" "prod" get pods -o json | jq .
 ```
+
+### Streaming commands
+
+`logs -f` / `--follow` and `get -w` / `--watch` / `--watch-only` never exit on their own, so xctx runs them in all matching contexts concurrently and streams stdout and stderr live, prefixing each line with `[context]` (`--header ""` removes the prefix). `--timeout`, `--parallel` and `--fail-fast` do not apply: streams are never cut off by a timeout. Press Ctrl+C to stop all streams.
 
 ### Output
 
