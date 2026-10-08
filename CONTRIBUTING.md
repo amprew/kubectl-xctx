@@ -4,7 +4,7 @@ Thank you for your interest in contributing!
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.26+
 - `kubectl` on your PATH
 - `golangci-lint` for linting (`brew install golangci-lint` or see [install docs](https://golangci-lint.run/usage/install/))
 

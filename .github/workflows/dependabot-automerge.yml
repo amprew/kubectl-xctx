@@ -1,0 +1,45 @@
+name: Dependabot auto-merge
+
+# Queues GitHub auto-merge on Dependabot PRs that fall within the policy below.
+# Auto-merge only completes once branch protection's required checks pass, so
+# this never merges anything CI hasn't validated. Requires "Allow auto-merge"
+# in repo settings and required status checks on main.
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'be0x74a/kubectl-xctx'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      # Useful outputs from steps.meta:
+      #   update-type:       version-update:semver-{major,minor,patch}
+      #                      (for grouped PRs, the largest bump in the group)
+      #   package-ecosystem: gomod | github_actions
+      #   dependency-type:   direct:production | direct:development | indirect
+      # Policy:
+      # - Majors never auto-merge: they can change behaviour or inputs.
+      # - GitHub Actions minor/patch: CI-only, SHA-pinned, so the bump is a
+      #   reviewable diff and can't change what ships.
+      # - Go modules patch only: these are compiled into the released binary,
+      #   so minor bumps (and grouped PRs containing one) get a human review.
+      - name: Enable auto-merge
+        if: >-
+          (steps.meta.outputs.package-ecosystem == 'github_actions' &&
+            (steps.meta.outputs.update-type == 'version-update:semver-minor' ||
+             steps.meta.outputs.update-type == 'version-update:semver-patch')) ||
+          (steps.meta.outputs.package-ecosystem == 'gomod' &&
+            steps.meta.outputs.update-type == 'version-update:semver-patch')
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
