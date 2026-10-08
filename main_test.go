@@ -14,12 +14,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// mockKubectl replaces kubectlRunner for the duration of the test.
+// mockKubectl replaces kubectlRunner (and streamRunner, backed by the same fn)
+// for the duration of the test.
 func mockKubectl(t *testing.T, fn func(ctx context.Context, args ...string) ([]byte, []byte, error)) {
 	t.Helper()
-	orig := kubectlRunner
+	orig, origStream := kubectlRunner, streamRunner
 	kubectlRunner = fn
-	t.Cleanup(func() { kubectlRunner = orig })
+	streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
+		stdout, stderr, err := fn(ctx, args...)
+		_, _ = out.Write(stdout)
+		_, _ = errOut.Write(stderr)
+		return err
+	}
+	t.Cleanup(func() { kubectlRunner, streamRunner = orig, origStream })
 }
 
 // fakeContextList is the standard set of contexts returned by the mock.
@@ -149,7 +156,7 @@ func TestPrintResult_StderrPropagated(t *testing.T) {
 // --- execute ---
 
 func TestExecute_InvalidRegex(t *testing.T) {
-	err := execute("[invalid", nil, false, false, 0, false, "")
+	err := execute("[invalid", nil, false, false, false, 0, false, "")
 	if err == nil {
 		t.Fatal("expected error for invalid regex, got nil")
 	}
@@ -157,7 +164,7 @@ func TestExecute_InvalidRegex(t *testing.T) {
 
 func TestExecute_NoMatch(t *testing.T) {
 	useFakeKubectl(t)
-	err := execute("nonexistent", []string{"get", "pods"}, false, false, 0, false, "### Context: {context}")
+	err := execute("nonexistent", []string{"get", "pods"}, false, false, false, 0, false, "### Context: {context}")
 	if err != nil {
 		t.Errorf("expected nil error for no-match case, got: %v", err)
 	}
@@ -165,7 +172,7 @@ func TestExecute_NoMatch(t *testing.T) {
 
 func TestExecute_NoCommand(t *testing.T) {
 	useFakeKubectl(t)
-	err := execute("prod", nil, false, false, 0, false, "### Context: {context}")
+	err := execute("prod", nil, false, false, false, 0, false, "### Context: {context}")
 	if err == nil {
 		t.Fatal("expected error when no kubectl command given, got nil")
 	}
@@ -235,6 +242,37 @@ func TestRunSequential_FailFast(t *testing.T) {
 	}
 	if callCount != 1 {
 		t.Errorf("fail-fast should stop after first failure, but kubectl was called %d times", callCount)
+	}
+}
+
+func TestRunSequential_LiveOutput(t *testing.T) {
+	original := streamRunner
+	t.Cleanup(func() { streamRunner = original })
+	written := make(chan struct{})
+	release := make(chan struct{})
+	streamRunner = func(_ context.Context, _ []string, out, _ io.Writer) error {
+		_, _ = io.WriteString(out, "live\n")
+		close(written)
+		<-release
+		return nil
+	}
+	var mu sync.Mutex
+	var out strings.Builder
+	w := &streamWriter{out: &out, mu: &mu}
+	done := make(chan error, 1)
+	go func() {
+		done <- runSequential([]string{"prod-a"}, []string{"logs", "-f"}, 0, false, "### Context: {context}", w, io.Discard)
+	}()
+	<-written
+	mu.Lock()
+	got := out.String()
+	mu.Unlock()
+	if got != "### Context: prod-a\nlive\n" {
+		t.Errorf("output not written live, got: %q", got)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -390,35 +428,6 @@ func TestCompleteArgs_KubectlCompletionError(t *testing.T) {
 	}
 }
 
-func TestIsStreaming(t *testing.T) {
-	for _, test := range []struct {
-		args []string
-		want bool
-	}{
-		{[]string{"logs", "-f", "-n", "my-ns", "-l", "app=my-app"}, true},
-		{[]string{"logs", "pod", "--follow"}, true},
-		{[]string{"logs", "pod", "--follow=true"}, true},
-		{[]string{"logs", "pod", "-f=false"}, false},
-		{[]string{"logs", "pod", "--follow=false"}, false},
-		{[]string{"get", "pods", "-w"}, true},
-		{[]string{"get", "pods", "--watch"}, true},
-		{[]string{"get", "pods", "--watch=true"}, true},
-		{[]string{"get", "pods", "--watch-only"}, true},
-		{[]string{"get", "pods", "--watch=false"}, false},
-		{[]string{"apply", "-f", "deployment.yaml"}, false},
-		{[]string{"logs", "pod"}, false},
-		{[]string{"get", "pods", "--", "-w"}, false},
-		{[]string{"--", "logs", "pod", "-f"}, true},
-		{nil, false},
-	} {
-		t.Run(strings.Join(test.args, " "), func(t *testing.T) {
-			if got := isStreaming(test.args); got != test.want {
-				t.Errorf("isStreaming(%v) = %v, want %v", test.args, got, test.want)
-			}
-		})
-	}
-}
-
 func TestStreamWriter(t *testing.T) {
 	for _, prefix := range []string{"[prod] ", ""} {
 		t.Run(prefix, func(t *testing.T) {
@@ -444,15 +453,17 @@ func TestStreamWriter(t *testing.T) {
 }
 
 func TestStreamWriter_SplitLines(t *testing.T) {
-	var out strings.Builder
-	var mu sync.Mutex
-	first := &streamWriter{out: &out, mu: &mu, prefix: "[a] "}
-	second := &streamWriter{out: &out, mu: &mu, prefix: "[b] "}
-	_, _ = io.WriteString(first, "split ")
-	_, _ = io.WriteString(second, "other\n")
-	_, _ = io.WriteString(first, "line\n")
-	if want := "[b] other\n[a] split line\n"; out.String() != want {
-		t.Errorf("output = %q, want %q", out.String(), want)
+	for _, prefixes := range [][2]string{{"[a] ", "[b] "}, {"", ""}} {
+		var out strings.Builder
+		var mu sync.Mutex
+		first := &streamWriter{out: &out, mu: &mu, prefix: prefixes[0]}
+		second := &streamWriter{out: &out, mu: &mu, prefix: prefixes[1]}
+		_, _ = io.WriteString(first, "split ")
+		_, _ = io.WriteString(second, "other\n")
+		_, _ = io.WriteString(first, "line\n")
+		if want := prefixes[1] + "other\n" + prefixes[0] + "split line\n"; out.String() != want {
+			t.Errorf("output = %q, want %q", out.String(), want)
+		}
 	}
 }
 
@@ -461,7 +472,7 @@ func TestRunStreaming_Cancellation(t *testing.T) {
 	t.Cleanup(func() { streamRunner = original })
 	streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
 		<-ctx.Done()
-		return ctx.Err()
+		return errors.New("exit status 1")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -473,11 +484,33 @@ func TestRunStreaming_Cancellation(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if err == nil || err.Error() != "2 context(s) failed" {
-			t.Errorf("unexpected cancellation error: %v", err)
+		if err != nil {
+			t.Errorf("cancellation should not be a failure, got: %v", err)
+		}
+		if strings.Contains(errOut.String(), "failed") {
+			t.Errorf("unexpected failure report: %q", errOut.String())
 		}
 	case <-time.After(time.Second):
 		t.Fatal("streams did not stop on cancellation")
+	}
+}
+
+func TestRunStreaming_ExitBeforeCancel(t *testing.T) {
+	// kubectl may exit on SIGINT slightly before xctx cancels ctx.
+	original := streamRunner
+	t.Cleanup(func() { streamRunner = original })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	streamRunner = func(context.Context, []string, io.Writer, io.Writer) error {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		return errors.New("exit status 1")
+	}
+	var out, errOut strings.Builder
+	if err := runStreaming(ctx, []string{"prod-a"}, []string{"get", "pods", "-w"}, "", &out, &errOut); err != nil {
+		t.Errorf("cancellation should not be a failure, got: %v", err)
 	}
 }
 
@@ -524,26 +557,47 @@ func TestRunStreaming_LiveConcurrentOutput(t *testing.T) {
 	}
 }
 
-func TestExecute_Streaming(t *testing.T) {
+func TestExecute_Stream(t *testing.T) {
 	useFakeKubectl(t)
-	original := streamRunner
-	t.Cleanup(func() { streamRunner = original })
-	for _, args := range [][]string{{"logs", "-f"}, {"get", "pods", "-w"}} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			called := make(chan string, 2)
-			streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
-				if _, ok := ctx.Deadline(); ok {
-					return errors.New("stream must ignore timeout")
-				}
-				called <- args[1]
-				return errors.New("stream failed")
-			}
-			if err := execute("prod", args, false, false, time.Nanosecond, true, ""); err == nil || err.Error() != "2 context(s) failed" {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if len(called) != 2 {
-				t.Errorf("expected both contexts despite fail-fast, got %d", len(called))
-			}
-		})
+	called := make(chan string, 2)
+	streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
+		if _, ok := ctx.Deadline(); !ok {
+			return errors.New("stream must honour timeout")
+		}
+		called <- args[1]
+		return errors.New("stream failed")
+	}
+	if err := execute("prod", []string{"logs", "-f"}, false, true, false, time.Minute, true, ""); err == nil || err.Error() != "2 context(s) failed" {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if len(called) != 2 {
+		t.Errorf("expected both contexts despite fail-fast, got %d", len(called))
+	}
+}
+
+func TestExecute_StreamTimeoutNotFailure(t *testing.T) {
+	useFakeKubectl(t)
+	streamRunner = func(ctx context.Context, args []string, out, errOut io.Writer) error {
+		<-ctx.Done()
+		return errors.New("signal: killed")
+	}
+	if err := execute("prod", []string{"get", "pods", "-w"}, false, true, false, 10*time.Millisecond, false, ""); err != nil {
+		t.Errorf("timeout should not be a failure, got: %v", err)
+	}
+}
+
+func TestExecute_NoStreamDetection(t *testing.T) {
+	// Without --stream, watch commands run sequentially like any other.
+	useFakeKubectl(t)
+	var calls []string
+	streamRunner = func(_ context.Context, args []string, _, _ io.Writer) error {
+		calls = append(calls, args[1])
+		return nil
+	}
+	if err := execute("prod", []string{"get", "pods", "-w"}, false, false, false, 0, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(calls, ",") != "prod-us-east,prod-eu-west" {
+		t.Errorf("expected sequential calls in order, got %v", calls)
 	}
 }

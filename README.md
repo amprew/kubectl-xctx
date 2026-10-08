@@ -33,9 +33,10 @@ xctx flags must come before the pattern. Everything after the pattern is passed 
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--parallel` | `-p` | false | Run across all contexts concurrently |
+| `--parallel` | `-p` | false | Run across all contexts concurrently, buffering output per context |
+| `--stream` | | false | Run across all contexts concurrently, streaming live output prefixed with `[context]` |
 | `--list` | `-l` | false | List matching contexts without executing |
-| `--timeout` | `-t` | 0 | Per-context timeout (e.g. `10s`, `1m`). 0 = no timeout. Ignored for streamed output. |
+| `--timeout` | `-t` | 0 | Per-context timeout (e.g. `10s`, `1m`). 0 = no timeout. With `--stream`, stops all streams after this duration |
 | `--fail-fast` | | false | Stop after first failure (sequential mode only) |
 | `--header` | | `### Context: {context}` | Header template. Use `{context}` as placeholder, `""` to suppress |
 | `--version` | | | Print version |
@@ -59,10 +60,10 @@ kubectl xctx --list "prod"
 kubectl xctx --timeout 10s "." get pods -n kube-system
 
 # Follow logs across all matching contexts (streams live, prefixed per context)
-kubectl xctx "prod" logs -f -n my-ns -l app=my-app
+kubectl xctx --stream "prod" logs -f -n my-ns -l app=my-app
 
-# Watch pods across all matching contexts
-kubectl xctx "prod" get pods -w -n my-ns
+# Watch pods across all matching contexts for 30 seconds
+kubectl xctx --stream --timeout 30s "prod" get pods -w -n my-ns
 
 # Stop immediately on first failure
 kubectl xctx --fail-fast "prod" apply -f deployment.yaml
@@ -71,9 +72,11 @@ kubectl xctx --fail-fast "prod" apply -f deployment.yaml
 kubectl xctx --header "" "prod" get pods -o json | jq .
 ```
 
-### Streaming commands
+### Execution modes
 
-`logs -f` / `--follow` and `get -w` / `--watch` / `--watch-only` never exit on their own, so xctx runs them in all matching contexts concurrently and streams stdout and stderr live, prefixing each line with `[context]` (`--header ""` removes the prefix). `--timeout`, `--parallel` and `--fail-fast` do not apply: streams are never cut off by a timeout. Press Ctrl+C to stop all streams.
+- **Sequential (default):** one context at a time. Each context's output is written live, as it arrives, under its header.
+- **`--parallel`:** all contexts concurrently. Output is buffered and printed grouped per context, in input order.
+- **`--stream`:** all contexts concurrently, with stdout and stderr written live and each line prefixed with `[context]` (`--header ""` drops the prefix; output stays line-buffered so contexts never mix mid-line). Use it for commands that don't exit on their own, such as `logs -f` or `get -w`. `--timeout` stops all streams after the given duration; `--fail-fast` does not apply. Streams ended by Ctrl+C or `--timeout` are not reported as failures.
 
 ### Output
 
