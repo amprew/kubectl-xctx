@@ -76,7 +76,7 @@ kubectl xctx --header "" "prod" get pods -o json | jq .
 
 - **Sequential (default):** one context at a time. Each context's output is written live, as it arrives, under its header.
 - **`--parallel`:** all contexts concurrently. Output is buffered and printed grouped per context, in input order.
-- **`--stream`:** all contexts concurrently, with stdout and stderr written live and each line prefixed with `[context]` (`--header ""` drops the prefix; output stays line-buffered so contexts never mix mid-line). Use it for commands that don't exit on their own, such as `logs -f` or `get -w`. `--timeout` stops all streams after the given duration; `--fail-fast` does not apply. Streams ended by Ctrl+C or `--timeout` are not reported as failures.
+- **`--stream`:** all contexts concurrently, with stdout and stderr written live and each line prefixed with `[context]` (`--header ""` drops the prefix; output stays line-buffered so contexts never mix mid-line). Use it for commands that don't exit on their own, such as `logs -f` or `get -w`. `--timeout` stops all streams after the given duration. It can't be combined with `--parallel` or `--fail-fast`. Streams ended by Ctrl+C or `--timeout` are not reported as failures.
 
 ### Output
 

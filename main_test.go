@@ -567,11 +567,35 @@ func TestExecute_Stream(t *testing.T) {
 		called <- args[1]
 		return errors.New("stream failed")
 	}
-	if err := execute("prod", []string{"logs", "-f"}, false, true, false, time.Minute, true, ""); err == nil || err.Error() != "2 context(s) failed" {
+	if err := execute("prod", []string{"logs", "-f"}, false, true, false, time.Minute, false, ""); err == nil || err.Error() != "2 context(s) failed" {
 		t.Errorf("unexpected error: %v", err)
 	}
 	if len(called) != 2 {
-		t.Errorf("expected both contexts despite fail-fast, got %d", len(called))
+		t.Errorf("expected both contexts to run, got %d", len(called))
+	}
+}
+
+func TestNewCmd_StreamFlagConflicts(t *testing.T) {
+	for _, test := range []struct {
+		flag string
+		want string
+	}{
+		{"--parallel", "--stream and --parallel cannot be used together"},
+		{"-p", "--stream and --parallel cannot be used together"},
+		{"--fail-fast", "--fail-fast cannot be used with --stream"},
+	} {
+		t.Run(test.flag, func(t *testing.T) {
+			mockKubectl(t, func(context.Context, ...string) ([]byte, []byte, error) {
+				t.Error("kubectl must not run when flags conflict")
+				return nil, nil, nil
+			})
+			cmd := newCmd()
+			cmd.SetArgs([]string{"--stream", test.flag, "prod", "get", "pods", "-w"})
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Errorf("expected error containing %q, got: %v", test.want, err)
+			}
+		})
 	}
 }
 

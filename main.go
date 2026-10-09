@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -86,6 +87,12 @@ Examples:
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(_ *cobra.Command, args []string) error {
+			if stream && parallel {
+				return errors.New("--stream and --parallel cannot be used together (--stream already runs all contexts concurrently)")
+			}
+			if stream && failFast {
+				return errors.New("--fail-fast cannot be used with --stream (it only applies to sequential mode)")
+			}
 			return execute(args[0], args[1:], parallel, stream, list, timeout, failFast, header)
 		},
 	}
